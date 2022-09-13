@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -62,12 +63,20 @@ func main() {
 	log.Println("SystemID:", sysident.SystemID, "Timeline:", sysident.Timeline, "XLogPos:", sysident.XLogPos, "DBName:", sysident.DBName)
 
 	slotName := "pglogrepl_demo"
-
-	_, err = pglogrepl.CreateReplicationSlot(context.Background(), conn, slotName, outputPlugin, pglogrepl.CreateReplicationSlotOptions{Temporary: true})
+	getReplicationSlot := fmt.Sprintf("SELECT * FROM pg_replication_slots WHERE slot_name='%s'", slotName)
+	res, err := conn.Exec(context.Background(), getReplicationSlot).ReadAll()
 	if err != nil {
-		log.Fatalln("CreateReplicationSlot failed:", err)
+		panic(err)
 	}
-	log.Println("Created temporary replication slot:", slotName)
+	if len(res) == 0 {
+		_, err = pglogrepl.CreateReplicationSlot(context.Background(), conn, slotName, outputPlugin, pglogrepl.CreateReplicationSlotOptions{Temporary: false})
+		if err != nil {
+			log.Fatalln("CreateReplicationSlot failed:", err)
+		}
+		log.Println("Created temporary replication slot:", slotName)
+	}
+
+	log.Println("Log pos", sysident.XLogPos)
 	err = pglogrepl.StartReplication(context.Background(), conn, slotName, sysident.XLogPos, pglogrepl.StartReplicationOptions{PluginArgs: pluginArguments})
 	if err != nil {
 		log.Fatalln("StartReplication failed:", err)
@@ -82,7 +91,9 @@ func main() {
 
 	for {
 		if time.Now().After(nextStandbyMessageDeadline) {
-			err = pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
+			err = pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{
+				WALWritePosition: clientXLogPos,
+			})
 			if err != nil {
 				log.Fatalln("SendStandbyStatusUpdate failed:", err)
 			}
@@ -136,7 +147,6 @@ func main() {
 			log.Printf("Receive a logical replication message: %s", logicalMsg.Type())
 			switch logicalMsg := logicalMsg.(type) {
 			case *pglogrepl.RelationMessage:
-				fmt.Println("relation")
 				relations[logicalMsg.RelationID] = logicalMsg
 
 			case *pglogrepl.BeginMessage:
@@ -166,18 +176,76 @@ func main() {
 							log.Fatalln("error decoding column data:", err)
 						}
 						values[colName] = val
+					case 'b':
+						fmt.Println("byte data", col.Data)
 					}
+
 				}
 				log.Printf("INSERT INTO %s.%s: %v", rel.Namespace, rel.RelationName, values)
 
 			case *pglogrepl.UpdateMessage:
 				// ...
+				rel, ok := relations[logicalMsg.RelationID]
+				if !ok {
+					log.Fatalf("unknown relation ID %d", logicalMsg.RelationID)
+				}
+				oldValues := map[string]interface{}{}
+				fmt.Println("oldTuple", logicalMsg.OldTuple)
+				if logicalMsg.OldTuple != nil {
+					for idx, col := range logicalMsg.OldTuple.Columns {
+						colName := rel.Columns[idx].Name
+						switch col.DataType {
+						case 'n': // null
+							oldValues[colName] = nil
+						case 'u': // unchanged toast
+							// This TOAST value was not changed. TOAST values are not stored in the tuple, and logical replication doesn't want to spend a disk read to fetch its value for you.
+							fmt.Println(col.Data)
+						case 't': //text
+							val, err := decodeTextColumnData(connInfo, col.Data, rel.Columns[idx].DataType)
+							if err != nil {
+								log.Fatalln("error decoding column data:", err)
+							}
+							oldValues[colName] = val
+						case 'b':
+							fmt.Println("byte data", col.Data)
+						}
+
+					}
+				}
+				newValues := map[string]interface{}{}
+				for idx, col := range logicalMsg.NewTuple.Columns {
+					colName := rel.Columns[idx].Name
+					switch col.DataType {
+					case 'n': // null
+						newValues[colName] = nil
+					case 'u': // unchanged toast
+						// This TOAST value was not changed. TOAST values are not stored in the tuple, and logical replication doesn't want to spend a disk read to fetch its value for you.
+						fmt.Println(col.Data)
+					case 't': //text
+						val, err := decodeTextColumnData(connInfo, col.Data, rel.Columns[idx].DataType)
+						if err != nil {
+							log.Fatalln("error decoding column data:", err)
+						}
+						newValues[colName] = val
+					case 'b':
+						fmt.Println("byte data", col.Data)
+					}
+
+				}
+
+				log.Printf("Update %s.%s: after %v before %v", rel.Namespace, rel.RelationName, newValues, oldValues)
+
 			case *pglogrepl.DeleteMessage:
 				// ...
+				s, _ := json.Marshal(logicalMsg)
+				fmt.Println("delete message", string(s))
 			case *pglogrepl.TruncateMessage:
 				// ...
+				s, _ := json.Marshal(logicalMsg)
+				fmt.Println("truncate message", string(s))
 
 			case *pglogrepl.TypeMessage:
+				fmt.Println("type message", logicalMsg)
 			case *pglogrepl.OriginMessage:
 			default:
 				log.Printf("Unknown message type in pgoutput stream: %T", logicalMsg)
